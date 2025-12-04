@@ -3,10 +3,9 @@ import next from "next";
 import { Server as IOServer } from "socket.io";
 import { parse } from "url";
 import { PrismaClient } from "@prisma/client";
-import { NextApiRequest, NextApiResponse } from "next"; // Tipos auxiliares
 
 // --- Váriaveis Globais (Singleton Pattern) ---
-// ESSENCIAL: Mantêm o Socket.IO Server e o HTTP Server vivos entre as chamadas Serverless
+// ESSENCIAL: Armazena as instâncias para reutilização em chamadas Serverless subsequentes.
 let io: IOServer | null = null;
 let httpServer: http.Server | null = null;
 
@@ -18,19 +17,20 @@ const handle = app.getRequestHandler();
 const prisma = new PrismaClient();
 
 // --- Função de Inicialização do Servidor ---
+// Esta função cria e configura o servidor HTTP e o Socket.IO.
 const initServer = async () => {
   await app.prepare();
 
   // 1. Criar servidor HTTP nativo
+  // Ele usa o handler do Next.js por padrão para rotas não-Socket.IO
   const server = http.createServer((req, res) => {
-    // Por padrão, delega a requisição para o Next.js
     const parsedUrl = parse(req.url || "", true);
     handle(req, res, parsedUrl);
   });
 
   httpServer = server; // Armazena a referência global
 
-  // 2. Configurar Socket.IO
+  // 2. Configurar Socket.IO e anexar ao servidor HTTP
   io = new IOServer(server, {
     path: "/api/socketio",
     cors: {
@@ -123,18 +123,17 @@ const initServer = async () => {
 
 // --- Exportação do Handler Serverless ---
 // A Vercel/Next.js irá chamar esta função para processar as requisições.
+// Ela é a única função que a Vercel executa.
 export default async (req: http.IncomingMessage, res: http.ServerResponse) => {
-  // Inicializa o servidor apenas na primeira vez
+  // Inicializa o servidor apenas na primeira requisição (Singleton)
   if (!io) {
     await initServer();
   }
 
-  // CRÍTICO: Se a requisição for para o Socket.IO, devemos passá-la
-  // para o servidor HTTP que o Socket.IO está escutando,
-  // simulando um evento de requisição HTTP
+  // CRÍTICO: Se a requisição for para o Socket.IO (/api/socketio),
+  // passamos a requisição para o servidor HTTP que criamos,
+  // simulando uma requisição para um servidor tradicional.
   if (req.url?.startsWith("/api/socketio") && httpServer) {
-    // Usamos .emit('request') para que o servidor que está anexado ao Socket.IO
-    // possa processar a requisição /api/socketio
     return httpServer.emit("request", req, res);
   }
 
