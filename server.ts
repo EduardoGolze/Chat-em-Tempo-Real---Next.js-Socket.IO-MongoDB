@@ -3,35 +3,45 @@ import next from "next";
 import { Server as IOServer } from "socket.io";
 import { parse } from "url";
 import { PrismaClient } from "@prisma/client";
+import { NextApiRequest, NextApiResponse } from "next"; // Tipos auxiliares
+
+// --- Váriaveis Globais (Singleton Pattern) ---
+// ESSENCIAL: Mantêm o Socket.IO Server e o HTTP Server vivos entre as chamadas Serverless
+let io: IOServer | null = null;
+let httpServer: http.Server | null = null;
 
 const dev = process.env.NODE_ENV !== "production";
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
-const PORT = parseInt(process.env.PORT || "4000", 10);
-
 // Instância do Prisma
 const prisma = new PrismaClient();
 
-async function main() {
+// --- Função de Inicialização do Servidor ---
+const initServer = async () => {
   await app.prepare();
 
-  // Criar servidor HTTP nativo
+  // 1. Criar servidor HTTP nativo
   const server = http.createServer((req, res) => {
+    // Por padrão, delega a requisição para o Next.js
     const parsedUrl = parse(req.url || "", true);
     handle(req, res, parsedUrl);
   });
 
-  // Configurar Socket.IO
-  const io = new IOServer(server, {
-    path: "/api/socketio", // Usar /api/socketio em vez de /socket.io
+  httpServer = server; // Armazena a referência global
+
+  // 2. Configurar Socket.IO
+  io = new IOServer(server, {
+    path: "/api/socketio",
     cors: {
       origin: "*",
       methods: ["GET", "POST"],
     },
+    // RECOMENDADO: Forçar polling, que é mais estável em ambientes Serverless
+    transports: ["polling"],
   });
 
-  // Configuração do Socket.IO
+  // 3. Configuração do Socket.IO (Lógica de Chat)
   io.on("connection", (socket) => {
     console.log("✅ Socket conectado — id:", socket.id);
 
@@ -47,7 +57,7 @@ async function main() {
           const messages = await prisma.message.findMany({
             where: { room },
             orderBy: { createdAt: "asc" },
-            take: 50, // Limitar a 50 últimas mensagens
+            take: 50,
           });
 
           callback?.({ ok: true, messages });
@@ -72,8 +82,6 @@ async function main() {
         ack?: (res: any) => void
       ) => {
         try {
-          console.log("mensagem recebida:", payload);
-
           // Salvar no banco de dados
           const savedMessage = await prisma.message.create({
             data: {
@@ -86,7 +94,7 @@ async function main() {
           });
 
           // Emitir mensagem para todos na sala
-          io.to(payload.room).emit("message", {
+          io?.to(payload.room).emit("message", {
             id: savedMessage.id,
             room: savedMessage.room,
             senderId: savedMessage.senderId,
@@ -110,14 +118,28 @@ async function main() {
     });
   });
 
-  server.listen(PORT, () => {
-    console.log(
-      `> Servidor Next + Socket.IO rodando em http://localhost:${PORT}`
-    );
-  });
-}
+  return httpServer;
+};
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// --- Exportação do Handler Serverless ---
+// A Vercel/Next.js irá chamar esta função para processar as requisições.
+export default async (req: http.IncomingMessage, res: http.ServerResponse) => {
+  // Inicializa o servidor apenas na primeira vez
+  if (!io) {
+    await initServer();
+  }
+
+  // CRÍTICO: Se a requisição for para o Socket.IO, devemos passá-la
+  // para o servidor HTTP que o Socket.IO está escutando,
+  // simulando um evento de requisição HTTP
+  if (req.url?.startsWith("/api/socketio") && httpServer) {
+    // Usamos .emit('request') para que o servidor que está anexado ao Socket.IO
+    // possa processar a requisição /api/socketio
+    return httpServer.emit("request", req, res);
+  }
+
+  // Para todas as outras requisições (Next.js pages, assets),
+  // usamos o handler padrão do Next.js.
+  const parsedUrl = parse(req.url || "", true);
+  return handle(req, res, parsedUrl);
+};
